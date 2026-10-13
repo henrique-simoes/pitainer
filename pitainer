@@ -3,7 +3,8 @@
 # Works with the bash 3.2 that ships with macOS. See README.md and SECURITY.md.
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
+FRESH=""
 SELF="$0"
 while [ -L "$SELF" ]; do
   link="$(readlink "$SELF")"
@@ -32,7 +33,8 @@ pitainer $VERSION - the pi coding agent in an Apple container
   pitainer denied             show hosts the proxy refused in running containers
   pitainer models [import F]  show, or replace, pi's models.json (custom endpoints)
   pitainer config             print the parsed config
-  pitainer update-providers   (maintainers) regenerate providers.lock from pi
+  pitainer update [--check]   look for a newer pi and base images; apply from your clone
+  pitainer build --fresh      rebuild from scratch to refresh system packages
 
 Config: $CONFIG
 EOF
@@ -171,7 +173,8 @@ build_image() {
   tmp="$(mktemp -d)"
   compose_containerfile > "$tmp/Containerfile"
   say "building pitainer:$tag (toolchains: ${TOOLCHAINS:-none})"
-  container build -t "pitainer:$tag" -f "$tmp/Containerfile" "$SELF_DIR" || { rm -rf "$tmp"; die "image build failed"; }
+  # --fresh ignores cached layers, so system packages are fetched again.
+  container build ${FRESH:+--no-cache} -t "pitainer:$tag" -f "$tmp/Containerfile" "$SELF_DIR" || { rm -rf "$tmp"; die "image build failed"; }
   rm -rf "$tmp"
   check_providers_lock "pitainer:$tag"
 }
@@ -183,7 +186,7 @@ check_providers_lock() {
     || die "could not read the provider list from the image"
   if [ "$got" != "$(cat "$SELF_DIR/providers.lock")" ]; then
     container image delete "$1" >/dev/null 2>&1 || true
-    die "pi's provider hosts differ from providers.lock. The pi version changed without a reviewed lock update; see README.md, 'Upgrading pi'."
+    die "pi's provider hosts differ from providers.lock. The pi version changed without a reviewed lock update; run './pitainer update' in your clone (README: Updating pi)."
   fi
 }
 
@@ -347,17 +350,123 @@ cmd_denied() {
   [ "$found" = 1 ] || say "no pitainer container is running"
 }
 
-cmd_update_providers() {
-  [ "${PITAINER_DEV:-}" = 1 ] || die "maintainer command: run it from a reviewed source checkout as PITAINER_DEV=1 ./pitainer update-providers"
-  need_container
+PI_PACKAGE="@earendil-works/pi-coding-agent"
+
+pinned_arg() { sed -n "s/^ARG $1=//p" "$SELF_DIR/Containerfile" | head -1; }
+
+# Every "name:tag@sha256:digest" reference to an official image, in the base
+# Containerfile and the shipped toolchains.
+pinned_images() {
+  cat "$SELF_DIR/Containerfile" "$SELF_DIR"/toolchains/*.Containerfile 2>/dev/null |
+    grep -oE '[a-z0-9]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' | sort -u
+}
+
+# Current digest of an official image tag, asked from the registry directly.
+registry_digest() {  # registry_digest <name> <tag>
+  local token
+  token="$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/$1:pull" |
+    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+  [ -n "$token" ] || return 1
+  curl -fsSI -H "Authorization: Bearer $token" \
+    -H "Accept: application/vnd.oci.image.index.v1+json" \
+    -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+    "https://registry-1.docker.io/v2/library/$1/manifests/$2" | tr -d '\r' |
+    sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p'
+}
+
+# Newest pi on npm, as "version integrity". Asked from inside a container, so
+# nothing has to be installed on the Mac.
+latest_pi() {
+  container run --rm "$(pinned_arg NODE_IMAGE)" npm view "$PI_PACKAGE" version dist.integrity 2>/dev/null |
+    sed -n "s/^version = '\(.*\)'$/\1/p; s/^dist.integrity = '\(.*\)'$/\1/p" | tr '\n' ' '
+}
+
+regenerate_providers_lock() {
   local tmp; tmp="$(mktemp -d)"
   cat "$SELF_DIR/Containerfile" > "$tmp/Containerfile"
-  container build -t pitainer:providers-tmp -f "$tmp/Containerfile" "$SELF_DIR" || die "image build failed"
+  container build -t pitainer:providers-tmp -f "$tmp/Containerfile" "$SELF_DIR" >/dev/null 2>&1 || { rm -rf "$tmp"; die "image build failed; run 'container build -f Containerfile .' to see why"; }
   rm -rf "$tmp"
-  container run --rm --entrypoint cat pitainer:providers-tmp /usr/local/share/pitainer/providers.generated > "$SELF_DIR/providers.lock"
+  container run --rm --entrypoint cat pitainer:providers-tmp /usr/local/share/pitainer/providers.generated > "$SELF_DIR/providers.lock.new" 2>/dev/null \
+    || die "could not read the provider list from the image"
   container image delete pitainer:providers-tmp >/dev/null 2>&1 || true
-  say "providers.lock regenerated. Review the change before committing:"
-  git -C "$SELF_DIR" --no-pager diff --stat -- providers.lock || true
+}
+
+# pitainer update [--check]
+#   Looks for a newer pi and newer base images. With --check it only reports.
+#   Otherwise, from a source checkout, it rewrites the pins, regenerates
+#   providers.lock, shows which hosts pi gains or loses, and offers to install
+#   and rebuild. Nothing is installed without a yes.
+cmd_update() {
+  local check_only="" cur_v cur_i new_v new_i ref name tag digest new changed="" hosts_changed="" latest
+  [ "${1:-}" = --check ] && check_only=1
+  need_container
+  [ -f "$SELF_DIR/Containerfile" ] || die "Containerfile not found next to this script"
+
+  cur_v="$(pinned_arg PI_VERSION)"; cur_i="$(pinned_arg PI_INTEGRITY)"
+  say "checking npm and the image registry"
+  latest="$(latest_pi)"
+  new_v="${latest%% *}"; new_i="${latest#* }"; new_i="${new_i%% *}"
+  [[ "$new_v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die "could not read the latest pi version from npm"
+  [[ "$new_i" =~ ^sha512-[A-Za-z0-9+/=]+$ ]] || die "could not read pi's checksum from npm"
+
+  if [ "$new_v" = "$cur_v" ] && [ "$new_i" = "$cur_i" ]; then echo "pi            $cur_v (current)"
+  elif [ "$new_v" = "$cur_v" ]; then die "npm now reports a different checksum for pi $cur_v than the one pinned. Do not update; investigate."
+  else echo "pi            $cur_v -> $new_v"; changed=1; fi
+
+  local updates=""
+  for ref in $(pinned_images); do
+    name="${ref%%:*}"; tag="${ref#*:}"; tag="${tag%%@*}"; digest="${ref##*@}"
+    new="$(registry_digest "$name" "$tag")" || new=""
+    [[ "$new" =~ ^sha256:[0-9a-f]{64}$ ]] || die "could not read the current digest of $name:$tag"
+    if [ "$new" = "$digest" ]; then printf '%-13s %s (current)\n' "$name" "$tag"
+    else printf '%-13s %s has a newer build\n' "$name" "$tag"; updates="$updates $name:$tag@$digest=$new"; changed=1; fi
+  done
+
+  if [ -z "$changed" ]; then
+    say "everything pinned is current. To refresh system packages anyway: pitainer build --fresh"
+    return 0
+  fi
+  if [ -n "$check_only" ]; then
+    say "updates are available. Apply them from your clone with: ./pitainer update"
+    return 0
+  fi
+
+  git -C "$SELF_DIR" rev-parse --git-dir >/dev/null 2>&1 || die "run 'update' from your pitainer clone, not the installed copy (it rewrites the pinned versions there)"
+  [ -z "$(git -C "$SELF_DIR" status --porcelain -- Containerfile toolchains providers.lock)" ] \
+    || die "Containerfile, toolchains or providers.lock have uncommitted changes; commit or discard them first"
+
+  if [ "$new_v" != "$cur_v" ]; then
+    sed -i '' -e "s|^ARG PI_VERSION=.*|ARG PI_VERSION=$new_v|" -e "s|^ARG PI_INTEGRITY=.*|ARG PI_INTEGRITY=$new_i|" "$SELF_DIR/Containerfile"
+  fi
+  local u old_ref
+  for u in $updates; do
+    old_ref="${u%%=*}"; new="${u##*=}"
+    sed -i '' -e "s|$old_ref|${old_ref%%@*}@$new|g" "$SELF_DIR/Containerfile" "$SELF_DIR"/toolchains/*.Containerfile
+  done
+
+  say "building once to read pi's provider hosts (a few minutes)"
+  regenerate_providers_lock
+  if ! cmp -s "$SELF_DIR/providers.lock" "$SELF_DIR/providers.lock.new"; then
+    hosts_changed=1
+    echo; echo "Hosts pi could reach change as follows (- removed, + added):"
+    # diff exits 1 when the files differ, which is the expected case here.
+    { diff "$SELF_DIR/providers.lock" "$SELF_DIR/providers.lock.new" || true; } | sed -n 's/^< /  - /p; s/^> /  + /p'
+    echo
+  fi
+  mv "$SELF_DIR/providers.lock.new" "$SELF_DIR/providers.lock"
+
+  say "pins updated in $SELF_DIR"
+  [ -n "$hosts_changed" ] || say "pi's provider hosts did not change"
+  git -C "$SELF_DIR" --no-pager diff --stat -- Containerfile toolchains providers.lock || true
+  printf 'Install this version and rebuild the image now? [y/N] ' >&2
+  local answer=""; read -r answer || true
+  case "$answer" in
+    y|Y|yes)
+      cmd_install --yes
+      "$SHARE_DIR/pitainer" build --fresh
+      say "done. Run 'pitainer test', then commit the changed pins in your clone." ;;
+    *) say "not installed. To undo: git -C $SELF_DIR checkout -- Containerfile toolchains providers.lock" ;;
+  esac
 }
 
 cmd_config() {
@@ -378,11 +487,12 @@ main() {
     -h|--help|help) usage ;;
     --version|version) echo "pitainer $VERSION" ;;
     install) cmd_install "$@" ;;
-    update-providers) cmd_update_providers ;;
     denied) cmd_denied ;;
     models) load_config; guard_source; cmd_models "$@" ;;
     config) load_config; cmd_config ;;
-    build) load_config; guard_source; need_container; check_provider_names; build_image "$(image_tag)"; say "image ready" ;;
+    build) [ "${1:-}" = --fresh ] && FRESH=1
+           load_config; guard_source; need_container; check_provider_names; build_image "$(image_tag)"; say "image ready" ;;
+    update) cmd_update "$@" ;;
     run)   load_config; guard_source; run_container pi "$@" ;;
     deps)  load_config; guard_source; run_container deps "$@" ;;
     test)  load_config; guard_source; run_container test ;;

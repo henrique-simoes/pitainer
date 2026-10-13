@@ -44,6 +44,7 @@ says plainly what is protected and what is not.
 - [Configuration reference](#configuration-reference)
 - [Your own model server (llama.cpp and others)](#your-own-model-server)
 - [Good to know](#good-to-know)
+- [Keeping things up to date](#keeping-things-up-to-date)
 - [Questions and answers](#questions-and-answers)
 - [Troubleshooting](#troubleshooting)
 - [Uninstall](#uninstall)
@@ -298,9 +299,57 @@ for the shape.
 - **Everything pi reads goes to your model provider.** Mount only what you are
   willing to send.
 
-## Updating pitainer
+## Keeping things up to date
 
-Pull the latest changes, look over what changed, then install again:
+There are five things that can go out of date. Each has one command.
+
+| What | How to update it |
+|---|---|
+| pi, and the base images it runs on | `./pitainer update` in your clone |
+| System packages inside the image | `pitainer build --fresh` |
+| pitainer itself | `git pull`, then `./pitainer install` |
+| Your project's packages | `pitainer deps` in the project folder |
+| Apple `container` | install the newer package from Apple's releases page |
+
+### Updating pi
+
+To see whether anything newer exists, without changing anything:
+
+```bash
+pitainer update --check
+```
+
+To apply it, run this in your clone:
+
+```bash
+./pitainer update
+```
+
+It does the whole job in one go:
+
+1. Finds the newest pi on npm and the newest builds of the pinned base images.
+2. Rewrites the pinned version, checksum and image digests.
+3. Builds once and regenerates `providers.lock` from the new pi.
+4. Shows you exactly which hosts pi would gain or lose.
+5. Asks before installing and rebuilding. Answer no and nothing is installed.
+
+Afterwards, run `pitainer test` and commit the changed files in your clone.
+
+pi never updates itself inside the container: its own update check is switched
+off, and the image is rebuilt from pinned versions. That is deliberate. A new
+pi version can add provider hosts, and step 4 is where you see that before it
+takes effect. A build also stops if pi's hosts do not match `providers.lock`.
+
+If you only follow someone else's clone, `git pull` and `./pitainer install`
+bring you their reviewed pins; you do not need `update` yourself.
+
+### Updating pitainer itself
+
+```bash
+git pull
+```
+
+Look over what changed, then:
 
 ```bash
 ./pitainer install
@@ -310,18 +359,23 @@ The installed copy is the one that runs. A clone that sits inside a mounted
 folder refuses to run directly, since pi could have edited it. Installing again
 is your moment to review.
 
-## Upgrading pi
+### Updating your project's packages
 
-The pi version is pinned in `Containerfile`, along with its checksum. To move
-to a newer pi, in a clone you have reviewed:
+`pitainer deps` installs what your `requirements.txt` or `pyproject.toml`
+asks for. To upgrade packages, pass the command you would normally use:
 
-1. Change `PI_VERSION` and `PI_INTEGRITY` in `Containerfile`.
-2. Run `PITAINER_DEV=1 ./pitainer update-providers`.
-3. Read `git diff providers.lock`. These are the hosts pi gains or loses.
-4. Commit, run `./pitainer install`, then `pitainer build`.
+```bash
+pitainer deps -- pip install --upgrade -r requirements.txt
+```
 
-A build stops if pi's provider hosts do not match `providers.lock`, so a pi
-upgrade can never widen network access without you seeing it.
+### Cleaning up old images
+
+Each rebuild leaves the previous image behind. List them, then delete the ones
+you no longer need:
+
+```bash
+container image ls
+```
 
 ## Questions and answers
 
@@ -360,7 +414,7 @@ No. Apple `container` needs Apple silicon and macOS 26 or later.
 
 **Which pi version does it run?**
 The one pinned in `Containerfile`, verified by checksum. See
-[Upgrading pi](#upgrading-pi).
+[Updating pi](#updating-pi).
 
 ## Troubleshooting
 
@@ -373,6 +427,7 @@ The one pinned in `Containerfile`, verified by checksum. See
 | `a pitainer session is already running` | Quit the other session first |
 | A provider will not connect | Run `pitainer denied` and add the host to `extra_hosts` |
 | `pip install` fails inside pi | Expected. Use `pitainer deps` |
+| `pi's provider hosts differ from providers.lock` | The pinned pi changed without its host list. Run `./pitainer update` in your clone |
 | pi starts with a "not reachable right now" warning | That host is down or you are offline; pi still starts |
 
 ## Uninstall
@@ -388,3 +443,7 @@ Remove pi's logins, sessions and installed project packages:
 ```bash
 container volume delete pitainer-agent pitainer-deps
 ```
+
+## License
+
+[MIT](LICENSE)

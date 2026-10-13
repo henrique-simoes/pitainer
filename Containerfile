@@ -5,8 +5,8 @@
 ARG NODE_IMAGE=node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
 FROM ${NODE_IMAGE}
 
-ARG PI_VERSION=1.1.0
-ARG PI_INTEGRITY=sha512-SeEi/4hdcHNgA9UWlefZl7ZZpm3dzi2OoxNjDHsBJ9o298LNOtbL4DGKgitlEj6uCTccvtw6f2hlCkTPVJ2RXg==
+ARG PI_VERSION=1.2.0
+ARG PI_INTEGRITY=sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==
 
 # bash, git, ripgrep, ca-certificates: required by pi (see pi's containerization doc).
 # iptables: per-user firewall.  sudo: pi -> tools user switch for the offline shell.
