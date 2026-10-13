@@ -1,0 +1,5 @@
+# pi may run exactly one program as the offline user. Nothing else.
+Defaults env_reset
+Defaults:pi env_keep += "PI_* TERM LANG LC_ALL COLORTERM"
+Defaults:pi !requiretty, !lecture
+pi ALL=(tools:work) NOPASSWD: /usr/local/libexec/pitainer/tool-env

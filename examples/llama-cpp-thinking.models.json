@@ -1,0 +1,39 @@
+{
+  "providers": {
+    "llama-cpp": {
+      "baseUrl": "http://100.64.0.5:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "none",
+      "models": [
+        {
+          "id": "my-thinking-model",
+          "name": "My thinking model (llama.cpp)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 32768,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "enable_thinking": { "$var": "thinking.enabled" },
+              "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
+            },
+            "thinkingTokenBudgetField": "thinking_budget_tokens",
+            "supportsUsageInStreaming": true,
+            "supportsStore": false,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}

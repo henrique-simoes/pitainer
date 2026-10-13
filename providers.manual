@@ -1,0 +1,20 @@
+# Hand-maintained corrections to providers.lock, which is generated from pi.
+#
+#   <provider> <host>   add a host the generator cannot derive (per-account or
+#                       per-region hosts, sign-in hosts built at runtime)
+#   !<host>             never allow this host, even though pi's code names it
+#                       (documentation links, not API endpoints)
+#
+# `*` matches one DNS label; a leading `*.` matches one or more.
+# If a provider fails to connect, `pitainer denied` shows what the proxy refused.
+
+!docs.aws.amazon.com
+!cloud.google.com
+
+amazon-bedrock bedrock-runtime.*.amazonaws.com
+amazon-bedrock sts.*.amazonaws.com
+google-vertex *-aiplatform.googleapis.com
+google-vertex aiplatform.googleapis.com
+google-vertex oauth2.googleapis.com
+github-copilot github.com
+github-copilot api.github.com

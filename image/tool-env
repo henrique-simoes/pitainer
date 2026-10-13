@@ -1,0 +1,11 @@
+#!/bin/bash
+# Runs as `tools`. Sets a clean environment, activates the project's virtual
+# environment if `pitainer deps` created one, then runs the real shell.
+umask 002
+export HOME=/home/tools USER=tools LOGNAME=tools
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+venv="$(/usr/local/libexec/pitainer/venv-path "$PWD")"
+if [ -n "$venv" ] && [ -x "$venv/bin/python" ]; then
+  export VIRTUAL_ENV="$venv" PATH="$venv/bin:$PATH"
+fi
+exec /bin/bash "$@"

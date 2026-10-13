@@ -1,0 +1,8 @@
+#!/bin/sh
+# Print the virtual-environment path for a directory under /work, or nothing.
+# /work/<mount>/<project>/... -> /deps/venvs/<mount>__<project>
+case "$1" in
+  /work/*/*) rest="${1#/work/}"; mount="${rest%%/*}"; rest="${rest#*/}"; proj="${rest%%/*}"
+             printf '/deps/venvs/%s__%s\n' "$mount" "$proj" ;;
+  /work/*)   printf '/deps/venvs/%s\n' "${1#/work/}" ;;
+esac

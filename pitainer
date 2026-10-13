@@ -1,0 +1,393 @@
+#!/bin/bash
+# pitainer: run the pi coding agent inside an Apple container.
+# Works with the bash 3.2 that ships with macOS. See README.md and SECURITY.md.
+set -euo pipefail
+
+VERSION=0.1.0
+SELF="$0"
+while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"
+  case "$link" in /*) SELF="$link" ;; *) SELF="$(dirname "$SELF")/$link" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd -P)"
+SHARE_DIR="${PITAINER_SHARE_DIR:-$HOME/.local/share/pitainer}"
+BIN_DIR="${PITAINER_BIN_DIR:-$HOME/.local/bin}"
+CONFIG_DIR="${PITAINER_CONFIG_DIR:-$HOME/.config/pitainer}"
+CONFIG="$CONFIG_DIR/pitainer.conf"
+RUNTIME_FILES="Containerfile image toolchains providers.lock providers.manual pitainer pitainer.conf.example profiles"
+
+die()  { echo "pitainer: $*" >&2; exit 1; }
+warn() { echo "pitainer: warning: $*" >&2; }
+say()  { echo "pitainer: $*" >&2; }
+
+usage() {
+  cat <<EOF
+pitainer $VERSION - the pi coding agent in an Apple container
+
+  pitainer install            copy pitainer out of the source checkout and set it up
+  pitainer build              build the image for your config
+  pitainer [run] [-- ARGS]    start pi in the current folder (ARGS go to pi)
+  pitainer deps [-- COMMAND]  install project dependencies (package indexes only)
+  pitainer test               run the acceptance tests against your config
+  pitainer denied             show hosts the proxy refused in running containers
+  pitainer models [import F]  show, or replace, pi's models.json (custom endpoints)
+  pitainer config             print the parsed config
+  pitainer update-providers   (maintainers) regenerate providers.lock from pi
+
+Config: $CONFIG
+EOF
+}
+
+# ------------------------------------------------------------------ config ---
+# The config is parsed line by line and validated. It is never sourced or eval'd.
+MOUNTS=""        # newline-separated "host_path|ro_or_rw"
+MEMORY="1g"; CPUS=""; PROVIDERS=""; EXTRA_HOSTS=""; TOOLCHAINS=""; DEPS_HOSTS=""
+DNS="1.1.1.1"; PASS_ENV=""; ALLOW_UNSAFE_MOUNTS="no"; PRIVATE_ENDPOINTS=""
+
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+words() { printf '%s' "$1" | tr ',' ' '; }
+check_words() {  # check_words <key> <regex> <words...>
+  local key="$1" re="$2" w; shift 2
+  for w in "$@"; do [[ "$w" =~ $re ]] || die "config: bad value '$w' for $key"; done
+}
+
+load_config() {
+  [ -f "$CONFIG" ] || die "no config at $CONFIG. Run 'pitainer install', then edit that file."
+  local line key val n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="$(trim "${line%%#*}")"
+    [ -z "$line" ] && continue
+    case "$line" in *=*) ;; *) die "config line $n: expected 'key = value'" ;; esac
+    key="$(trim "${line%%=*}")"; val="$(trim "${line#*=}")"
+    case "$key" in
+      mount)       MOUNTS="$MOUNTS$val"$'\n' ;;
+      memory)      [[ "$val" =~ ^[0-9]+[mg]$ ]] || die "config: memory must look like 1g or 512m"; MEMORY="$val" ;;
+      cpus)        [[ "$val" =~ ^[0-9]+$ ]] || die "config: cpus must be a number"; CPUS="$val" ;;
+      providers)   PROVIDERS="$(words "$val")";   check_words providers   '^[a-z0-9-]+$' $PROVIDERS ;;
+      extra_hosts) EXTRA_HOSTS="$(words "$val")"; check_words extra_hosts '^[a-z0-9.*-]+$' $EXTRA_HOSTS ;;
+      deps_hosts)  DEPS_HOSTS="$(words "$val")";  check_words deps_hosts  '^[a-z0-9.*-]+$' $DEPS_HOSTS ;;
+      toolchains)  TOOLCHAINS="$(words "$val")";  check_words toolchains  '^[a-z0-9._-]+$' $TOOLCHAINS ;;
+      env)         PASS_ENV="$(words "$val")";    check_words env         '^[A-Z_][A-Z0-9_]*$' $PASS_ENV ;;
+      dns)         [[ "$val" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "config: dns must be an IPv4 address"; DNS="$val" ;;
+      private_endpoint)
+        [[ "$val" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]] || die "config: private_endpoint must be ip:port, for example 100.64.0.5:8080"
+        PRIVATE_ENDPOINTS="$PRIVATE_ENDPOINTS $val" ;;
+      allow_unsafe_mounts) [ "$val" = yes ] || [ "$val" = no ] || die "config: allow_unsafe_mounts must be yes or no"; ALLOW_UNSAFE_MOUNTS="$val" ;;
+      *) die "config line $n: unknown key '$key'" ;;
+    esac
+  done < "$CONFIG"
+  [ -n "$MOUNTS" ] || die "config: set at least one 'mount = <folder>'"
+  [ -n "$PROVIDERS" ] || die "config: set 'providers = all' or a list of provider names"
+  case "$DNS" in 10.*|127.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+    die "config: dns must be a public resolver; private addresses are blocked inside the container" ;; esac
+  resolve_mounts
+}
+
+# Mounts become three parallel newline lists: host path, mode, name under /work.
+M_HOST=""; M_MODE=""; M_NAME=""
+within() {  # is $1 inside or equal to $2
+  [ "$2" = / ] && return 0
+  [ "$1" = "$2" ] || case "$1" in "$2"/*) return 0 ;; *) return 1 ;; esac
+}
+
+resolve_mounts() {
+  local entry path mode real name p protected
+  protected="$HOME/.ssh $HOME/.gnupg $HOME/.aws $HOME/.azure $HOME/.kube $HOME/.docker $HOME/.config
+             $HOME/.local $HOME/.pi $HOME/.claude $HOME/.netrc $HOME/.gitconfig $HOME/Library $SHARE_DIR $CONFIG_DIR"
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    mode=rw; path="$entry"
+    case "$entry" in *:ro) mode=ro; path="${entry%:ro}" ;; *:rw) path="${entry%:rw}" ;; esac
+    case "$path" in "~") path="$HOME" ;; "~/"*) path="$HOME/${path#\~/}" ;; esac
+    [ -d "$path" ] || die "config: mount folder does not exist: $path"
+    real="$(cd "$path" && pwd -P)"
+    for p in $protected; do
+      if within "$p" "$real" || within "$real" "$p"; then
+        if [ "$ALLOW_UNSAFE_MOUNTS" = yes ]; then
+          warn "UNSAFE: mounting $real, which exposes or contains $p"
+        else
+          die "refusing to mount $real: it exposes or contains $p (your home folder, credentials and pitainer's own files are never mounted)"
+        fi
+      fi
+    done
+    name="$(basename "$real")"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "config: mount folder name '$name' must use only letters, digits, dot, dash, underscore"
+    printf '%s\n' "$M_NAME" | grep -qxF "$name" && die "config: two mounts share the name '$name'"
+    M_HOST="$M_HOST$real"$'\n'; M_MODE="$M_MODE$mode"$'\n'; M_NAME="$M_NAME$name"$'\n'
+  done <<EOF
+$MOUNTS
+EOF
+}
+
+# A source checkout that pi can write to must not be run directly: a change made
+# from inside the container would then execute on the Mac. `install` copies it out.
+guard_source() {
+  [ "${PITAINER_DEV:-}" = 1 ] && return 0
+  local h
+  while IFS= read -r h; do
+    [ -z "$h" ] && continue
+    if within "$SELF_DIR" "$h"; then
+      die "this copy lives in $h, which the container can write to. Review it (git status, git diff), then run './pitainer install' and use the installed 'pitainer' command."
+    fi
+  done <<EOF
+$M_HOST
+EOF
+}
+
+# ------------------------------------------------------------------- image ---
+need_container() {
+  command -v container >/dev/null || die "Apple 'container' is not installed. See README.md."
+  [ "$(uname -m)" = arm64 ] || die "Apple silicon is required."
+  container system status >/dev/null 2>&1 || die "the container service is not running. Run: container system start"
+}
+
+sha() { shasum -a 256 | cut -c1-12; }
+
+toolchain_file() {
+  local t="$1"
+  if   [ -f "$CONFIG_DIR/toolchains/$t.Containerfile" ]; then echo "$CONFIG_DIR/toolchains/$t.Containerfile"
+  elif [ -f "$SELF_DIR/toolchains/$t.Containerfile" ];   then echo "$SELF_DIR/toolchains/$t.Containerfile"
+  else die "config: unknown toolchain '$t' (no $t.Containerfile in $SELF_DIR/toolchains or $CONFIG_DIR/toolchains)"; fi
+}
+
+compose_containerfile() {
+  cat "$SELF_DIR/Containerfile"
+  local t
+  for t in $TOOLCHAINS; do
+    printf '\n# ---- toolchain: %s ----\nUSER root\n' "$t"
+    cat "$(toolchain_file "$t")"
+  done
+}
+
+image_tag() {
+  { compose_containerfile; find "$SELF_DIR/image" -type f | sort | xargs cat; } | sha
+}
+
+image_exists() { container image inspect "$1" >/dev/null 2>&1; }
+
+build_image() {
+  local tag="$1" tmp
+  tmp="$(mktemp -d)"
+  compose_containerfile > "$tmp/Containerfile"
+  say "building pitainer:$tag (toolchains: ${TOOLCHAINS:-none})"
+  container build -t "pitainer:$tag" -f "$tmp/Containerfile" "$SELF_DIR" || { rm -rf "$tmp"; die "image build failed"; }
+  rm -rf "$tmp"
+  check_providers_lock "pitainer:$tag"
+}
+
+# The provider hosts pi ships must match the reviewed lock file exactly.
+check_providers_lock() {
+  local got
+  got="$(container run --rm --entrypoint cat "$1" /usr/local/share/pitainer/providers.generated 2>/dev/null)" \
+    || die "could not read the provider list from the image"
+  if [ "$got" != "$(cat "$SELF_DIR/providers.lock")" ]; then
+    container image delete "$1" >/dev/null 2>&1 || true
+    die "pi's provider hosts differ from providers.lock. The pi version changed without a reviewed lock update; see README.md, 'Upgrading pi'."
+  fi
+}
+
+ensure_image() {
+  IMAGE_TAG="$(image_tag)"
+  image_exists "pitainer:$IMAGE_TAG" || build_image "$IMAGE_TAG"
+}
+
+# ------------------------------------------------------------- allow-lists ---
+pi_hosts() {
+  local want="$PROVIDERS" excluded
+  excluded="$(grep '^!' "$SELF_DIR/providers.manual" 2>/dev/null | cut -c2- || true)"
+  { cat "$SELF_DIR/providers.lock"; grep -v -e '^!' -e '^#' -e '^$' "$SELF_DIR/providers.manual" 2>/dev/null || true; } |
+    awk -v want=" $want " '{ if (want == " all " || index(want, " " $1 " ")) print $2 }' |
+    { if [ -n "$excluded" ]; then grep -vxF "$excluded" || true; else cat; fi; }
+  local h; for h in $EXTRA_HOSTS; do echo "$h"; done
+}
+
+known_providers() { { cat "$SELF_DIR/providers.lock"; grep -v -e '^!' -e '^#' -e '^$' "$SELF_DIR/providers.manual" 2>/dev/null || true; } | cut -d' ' -f1 | sort -u; }
+
+check_provider_names() {
+  [ "$PROVIDERS" = all ] && return 0
+  local p known; known="$(known_providers)"
+  for p in $PROVIDERS; do
+    printf '%s\n' "$known" | grep -qxF "$p" || die "config: unknown provider '$p'. Known: $(echo $known)"
+  done
+}
+
+# --------------------------------------------------------------------- run ---
+container_workdir() {
+  local here i=1 h name
+  here="$(pwd -P)"
+  while IFS= read -r h; do
+    [ -z "$h" ] && continue
+    name="$(printf '%s\n' "$M_NAME" | sed -n "${i}p")"
+    if within "$here" "$h"; then printf '/work/%s%s\n' "$name" "${here#"$h"}"; return; fi
+    i=$((i + 1))
+  done <<EOF
+$M_HOST
+EOF
+  printf '/work/%s\n' "$(printf '%s\n' "$M_NAME" | sed -n 1p)"
+}
+
+running_session() { container ls 2>/dev/null | awk '$1 ~ /^pitainer-(pi|deps)-/ { print $1; exit }'; }
+
+# Dependency installs join the running session's container when there is one,
+# because its volumes cannot be attached twice.
+deps_in_session() {
+  local name="$1" args; shift
+  args=(exec -i --user deps --workdir "$(container_workdir)"
+        -e HOME=/home/deps -e USER=deps -e LOGNAME=deps -e "TERM=${TERM:-xterm-256color}"
+        -e HTTPS_PROXY=http://127.0.0.1:3129 -e https_proxy=http://127.0.0.1:3129
+        -e PIP_CACHE_DIR=/deps/cache/pip -e npm_config_cache=/deps/cache/npm -e UV_CACHE_DIR=/deps/cache/uv)
+  [ -t 0 ] && [ -t 1 ] && args+=(-t)
+  say "using the running session $name"
+  exec container "${args[@]}" "$name" /usr/local/libexec/pitainer/deps-run "$@"
+}
+
+run_container() {  # run_container <mode> [args...]
+  local mode="$1" session; shift
+  need_container
+  if [ "$mode" != test ]; then
+    session="$(running_session)"
+    if [ -n "$session" ] && [ "$mode" = deps ]; then deps_in_session "$session" "$@"; fi
+    [ -z "$session" ] || die "a pitainer session is already running ($session). Quit it first; only one can use pitainer's storage at a time."
+  fi
+  need_container; check_provider_names; ensure_image
+  local args i=1 h m name hosts deps_hosts v
+  hosts="$(pi_hosts | sort -u | tr '\n' ',')"
+  [ -n "$hosts" ] || die "the provider allow-list is empty"
+  deps_hosts="$(for h in $DEPS_HOSTS; do echo "$h"; done | tr '\n' ',')"
+  set -- "$mode" "$@"
+  args=(run --rm -i --name "pitainer-$mode-$$" -m "$MEMORY"
+        --cap-add NET_ADMIN --cap-add LINUX_IMMUTABLE --dns "$DNS"
+        -e "PITAINER_DNS=$DNS" -e "PITAINER_PI_HOSTS=$hosts" -e "PITAINER_DEPS_HOSTS=$deps_hosts"
+        -e "PITAINER_WORKDIR=$(container_workdir)" -e "TERM=${TERM:-xterm-256color}")
+  if [ -n "$PRIVATE_ENDPOINTS" ]; then
+    warn "private endpoints are open to pi:$PRIVATE_ENDPOINTS"
+    args+=(-e "PITAINER_PRIVATE_ENDPOINTS=$(echo $PRIVATE_ENDPOINTS | tr ' ' ',')")
+  fi
+  # A volume can be attached to one container at a time. Tests use throwaway
+  # storage inside the container so they can run beside a live session.
+  [ "$mode" = test ] || args+=(-v pitainer-agent:/home/pi/.pi/agent -v pitainer-deps:/deps)
+  [ -t 0 ] && [ -t 1 ] && args+=(-t)
+  [ -n "$CPUS" ] && args+=(-c "$CPUS")
+  while IFS= read -r h; do
+    [ -z "$h" ] && continue
+    m="$(printf '%s\n' "$M_MODE" | sed -n "${i}p")"; name="$(printf '%s\n' "$M_NAME" | sed -n "${i}p")"
+    if [ "$m" = ro ]; then args+=(--mount "type=bind,source=$h,target=/work/$name,readonly")
+    else args+=(-v "$h:/work/$name"); fi
+    i=$((i + 1))
+  done <<EOF
+$M_HOST
+EOF
+  if [ "$mode" = pi ]; then
+    for v in $PASS_ENV; do [ -n "${!v:-}" ] && args+=(-e "$v"); done
+    [ -f "$CONFIG_DIR/settings.json" ] && args+=(-e "PITAINER_USER_SETTINGS=$(cat "$CONFIG_DIR/settings.json")")
+  fi
+  exec container "${args[@]}" "pitainer:$IMAGE_TAG" "$@"
+}
+
+# ---------------------------------------------------------------- commands ---
+cmd_install() {
+  [ -f "$SELF_DIR/Containerfile" ] || die "run install from a pitainer source checkout"
+  [ "$SELF_DIR" = "$SHARE_DIR" ] && die "this is already the installed copy"
+  if git -C "$SELF_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    local dirty; dirty="$(git -C "$SELF_DIR" status --porcelain -- $RUNTIME_FILES 2>/dev/null || true)"
+    if [ -n "$dirty" ]; then
+      say "the source checkout has uncommitted changes in files that will run on your Mac:"
+      printf '%s\n' "$dirty" >&2
+      if [ "${1:-}" != --yes ]; then
+        printf 'Install them anyway? [y/N] ' >&2; read -r answer
+        case "$answer" in y|Y|yes) ;; *) die "nothing installed" ;; esac
+      fi
+    fi
+  fi
+  mkdir -p "$SHARE_DIR" "$BIN_DIR" "$CONFIG_DIR"
+  local f
+  for f in $RUNTIME_FILES; do rm -rf "${SHARE_DIR:?}/$f"; cp -R "$SELF_DIR/$f" "$SHARE_DIR/$f"; done
+  chmod 0755 "$SHARE_DIR/pitainer"
+  ln -sf "$SHARE_DIR/pitainer" "$BIN_DIR/pitainer"
+  say "installed to $SHARE_DIR, command at $BIN_DIR/pitainer"
+  if [ ! -f "$CONFIG" ]; then
+    cp "$SELF_DIR/pitainer.conf.example" "$CONFIG"
+    say "created $CONFIG - edit it (mounts and providers are required), then run: pitainer build"
+  fi
+  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "note: $BIN_DIR is not on your PATH" ;; esac
+}
+
+# models.json lives in pi's own folder in the container volume and is frozen
+# while pi runs. These commands are the only way to read or replace it.
+cmd_models() {
+  need_container; ensure_image
+  local sub="${1:-show}" file="${2:-}" session
+  session="$(running_session)"
+  case "$sub" in
+    show)
+      if [ -n "$session" ]; then container exec --user pi "$session" cat /home/pi/.pi/agent/models.json
+      else container run --rm -v pitainer-agent:/a --entrypoint cat "pitainer:$IMAGE_TAG" /a/models.json 2>/dev/null || say "no models.json yet"; fi ;;
+    import)
+      [ -f "$file" ] || die "usage: pitainer models import <file.json>"
+      [ -z "$session" ] || die "quit the running pitainer session first ($session)"
+      container run --rm -i --cap-add LINUX_IMMUTABLE -v pitainer-agent:/a --entrypoint sh "pitainer:$IMAGE_TAG" -c '
+        set -e; cat > /tmp/m.json
+        node -e "JSON.parse(require(\"fs\").readFileSync(\"/tmp/m.json\",\"utf8\"))" || { echo "pitainer: not valid JSON" >&2; exit 1; }
+        chattr -i /a/models.json 2>/dev/null || true
+        install -m 0400 -o pi -g work /tmp/m.json /a/models.json' < "$file" || die "import failed"
+      grep -q '"!' "$file" && warn "this models.json contains a !command value; pi will run it as the pi user, outside the offline shell"
+      say "models.json imported" ;;
+    *) die "usage: pitainer models [show | import <file.json>]" ;;
+  esac
+}
+
+cmd_denied() {
+  need_container
+  local c found=0
+  for c in $(container ls 2>/dev/null | awk '$1 ~ /^pitainer-/ { print $1 }'); do
+    found=1; echo "== $c"
+    container exec "$c" grep DENY /run/pitainer/proxy.log 2>/dev/null || echo "(nothing refused)"
+  done
+  [ "$found" = 1 ] || say "no pitainer container is running"
+}
+
+cmd_update_providers() {
+  [ "${PITAINER_DEV:-}" = 1 ] || die "maintainer command: run it from a reviewed source checkout as PITAINER_DEV=1 ./pitainer update-providers"
+  need_container
+  local tmp; tmp="$(mktemp -d)"
+  cat "$SELF_DIR/Containerfile" > "$tmp/Containerfile"
+  container build -t pitainer:providers-tmp -f "$tmp/Containerfile" "$SELF_DIR" || die "image build failed"
+  rm -rf "$tmp"
+  container run --rm --entrypoint cat pitainer:providers-tmp /usr/local/share/pitainer/providers.generated > "$SELF_DIR/providers.lock"
+  container image delete pitainer:providers-tmp >/dev/null 2>&1 || true
+  say "providers.lock regenerated. Review the change before committing:"
+  git -C "$SELF_DIR" --no-pager diff --stat -- providers.lock || true
+}
+
+cmd_config() {
+  echo "config:      $CONFIG"
+  echo "memory:      $MEMORY"; echo "cpus:        ${CPUS:-default}"; echo "dns:         $DNS"
+  echo "toolchains:  ${TOOLCHAINS:-none}"; echo "providers:   $PROVIDERS"
+  echo "env passed:  ${PASS_ENV:-none}"; echo "deps hosts:  ${DEPS_HOSTS:-none}"
+  echo "private endpoints:${PRIVATE_ENDPOINTS:- none}"
+  echo "mounts:"; paste -d' ' <(printf '%s' "$M_HOST") <(printf '%s' "$M_MODE") | sed 's/^/  /'
+  echo "pi may reach:"; pi_hosts | sort -u | sed 's/^/  /'
+}
+
+main() {
+  local cmd="${1:-run}"
+  [ $# -gt 0 ] && shift
+  [ "${1:-}" = "--" ] && shift
+  case "$cmd" in
+    -h|--help|help) usage ;;
+    --version|version) echo "pitainer $VERSION" ;;
+    install) cmd_install "$@" ;;
+    update-providers) cmd_update_providers ;;
+    denied) cmd_denied ;;
+    models) load_config; guard_source; cmd_models "$@" ;;
+    config) load_config; cmd_config ;;
+    build) load_config; guard_source; need_container; check_provider_names; build_image "$(image_tag)"; say "image ready" ;;
+    run)   load_config; guard_source; run_container pi "$@" ;;
+    deps)  load_config; guard_source; run_container deps "$@" ;;
+    test)  load_config; guard_source; run_container test ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

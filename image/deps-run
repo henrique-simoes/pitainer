@@ -1,0 +1,28 @@
+#!/bin/bash
+# Runs as `deps`: the user-started dependency path. Network is limited to the
+# package-index hosts in the config, through the proxy.
+#   deps-run                 install the project's Python dependencies into its venv
+#   deps-run <command...>    run a command with the project's venv active
+set -euo pipefail
+umask 002
+LIB=/usr/local/libexec/pitainer
+venv="$("$LIB/venv-path" "$PWD")"
+activate() { export VIRTUAL_ENV="$venv" PATH="$venv/bin:$PATH"; }
+
+if [ $# -gt 0 ]; then
+  [ -n "$venv" ] && [ -x "$venv/bin/python" ] && activate
+  exec "$@"
+fi
+
+if [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+  command -v python3 >/dev/null || { echo "pitainer: this image has no Python toolchain (add python-3.14 to toolchains)" >&2; exit 1; }
+  [ -n "$venv" ] || { echo "pitainer: run this from inside a project folder" >&2; exit 1; }
+  [ -x "$venv/bin/python" ] || python3 -m venv "$venv"
+  activate
+  if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install -e .; fi
+  echo "pitainer: dependencies installed in $venv"
+else
+  echo "pitainer: no requirements.txt or pyproject.toml here. Give a command, for example:" >&2
+  echo "  pitainer deps -- pip install requests" >&2
+  exit 1
+fi

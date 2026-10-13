@@ -1,0 +1,6 @@
+{
+  "shellPath": "/usr/local/libexec/pitainer/tool-shell",
+  "httpProxy": "http://127.0.0.1:3128",
+  "defaultProjectTrust": "never",
+  "enableInstallTelemetry": false
+}

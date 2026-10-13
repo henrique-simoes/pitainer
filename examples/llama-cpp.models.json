@@ -1,0 +1,25 @@
+{
+  "providers": {
+    "llama-cpp": {
+      "baseUrl": "http://100.64.0.5:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "none",
+      "models": [
+        {
+          "id": "my-model",
+          "name": "My model (llama.cpp)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "compat": {
+            "supportsUsageInStreaming": true,
+            "supportsStore": false,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}

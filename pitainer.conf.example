@@ -1,0 +1,43 @@
+# pitainer configuration. Copy to ~/.config/pitainer/pitainer.conf and edit.
+# This file is parsed, never executed. One "key = value" per line.
+
+# Folders pi may see, mounted at /work/<folder name>. Repeat for more folders.
+# Append :ro for read-only. Required. Your home folder, credential folders and
+# pitainer's own files are refused.
+# mount = ~/code
+# mount = ~/reference-docs:ro
+
+# Model providers pi may reach: "all" that the pinned pi version ships, or a list
+# of provider names (run `pitainer config` to see the resulting hosts). Required.
+# providers = anthropic
+
+# Extra hosts pi may reach, for custom endpoints you add to pi's models.json.
+# extra_hosts = llm.example.com
+
+# Memory cap for the container.
+memory = 1g
+
+# CPU count. Default: Apple container's default.
+# cpus = 4
+
+# Toolchain layers added to the image: files in toolchains/, or your own in
+# ~/.config/pitainer/toolchains/<name>.Containerfile. Default: none.
+# toolchains = python-3.14
+
+# Hosts the user-run `pitainer deps` command may reach. Default: none.
+# deps_hosts = pypi.org, files.pythonhosted.org
+
+# Environment variables to pass to pi if they are set on your Mac. The usual
+# alternative is to run /login inside pi; credentials then stay in the container.
+# env = ANTHROPIC_API_KEY
+
+# Public DNS resolver used by the proxy. Private addresses are blocked.
+dns = 1.1.1.1
+
+# A model server on a private network (VPN, tailnet), as ip:port. pi may reach
+# exactly this address and port; the rest of the private network stays blocked.
+# Repeat for more. The Mac itself is never allowed. Prints a warning on start.
+# private_endpoint = 100.64.0.5:8080
+
+# Set to yes only if you accept mounting a folder pitainer normally refuses.
+# allow_unsafe_mounts = no

@@ -1,0 +1,4 @@
+#!/bin/sh
+# pi's `shellPath`. pi calls this as `<shellPath> -c "<command>"`; every command is
+# handed to the `tools` user, which the firewall gives no network.
+exec /usr/bin/sudo -n -u tools -g work -- /usr/local/libexec/pitainer/tool-env "$@"
